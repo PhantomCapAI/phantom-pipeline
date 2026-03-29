@@ -515,6 +515,26 @@ async def get_agent_logs(project_id: str):
     return [dict(r) for r in rows]
 
 
+# ─── Debug: test agent calls directly ────────────────────────────────
+
+@app.get("/debug/agents")
+async def debug_agents():
+    """Test that both API keys work. Returns success/error for each."""
+    from agents import call_openai, call_claude
+    results = {}
+    try:
+        r = await call_openai("You are a test.", "Say 'ok'", model="gpt-4o")
+        results["openai"] = {"status": "ok", "response": r[:100]}
+    except Exception as e:
+        results["openai"] = {"status": "error", "error": str(e)}
+    try:
+        r = await call_claude("You are a test.", "Say 'ok'")
+        results["claude"] = {"status": "ok", "response": r[:100]}
+    except Exception as e:
+        results["claude"] = {"status": "error", "error": str(e)}
+    return results
+
+
 # ─── Health ───────────────────────────────────────────────────────────
 
 @app.get("/health")
