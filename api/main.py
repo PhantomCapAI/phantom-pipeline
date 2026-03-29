@@ -1,22 +1,27 @@
 """
-Phantom Pipeline — Autonomous Dev Orchestrator
-Standalone Zeabur service for managing the full build lifecycle:
-Idea → Architecture → Export → Build → Review → Deploy
+Phantom Pipeline v2 — Autonomous Dev Orchestrator
+Full autonomous loop: Idea → Architecture → Validation → Build → Review → Fix → Deploy
 
-Participants: Human (direction), ChatGPT (design), Claude (architecture), Claude Code (execution)
+Participants: Human (direction + gates), ChatGPT (design), Claude (architecture + review), Claude Code (execution)
 """
 
 import os
 import uuid
 import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+from orchestrator import (
+    run_architecture, run_build,
+    add_entry as orch_add_entry, set_phase as orch_set_phase,
+)
 
 
 # ─── Config ───────────────────────────────────────────────────────────
@@ -71,6 +76,19 @@ async def lifespan(app: FastAPI):
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """)
+    await p.execute("""
+        CREATE TABLE IF NOT EXISTS agent_logs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            agent TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cost_estimate NUMERIC(10, 6),
+            latency_ms INTEGER,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
     yield
     if pool:
         await pool.close()
@@ -78,7 +96,7 @@ async def lifespan(app: FastAPI):
 
 # ─── App ──────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Phantom Pipeline", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Phantom Pipeline", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -161,6 +179,7 @@ async def get_project(project_id: str):
 @app.delete("/projects/{project_id}")
 async def delete_project(project_id: str):
     p = await get_pool()
+    await p.execute("DELETE FROM agent_logs WHERE project_id = $1", project_id)
     await p.execute("DELETE FROM entries WHERE project_id = $1", project_id)
     await p.execute("DELETE FROM exports WHERE project_id = $1", project_id)
     await p.execute("DELETE FROM projects WHERE id = $1", project_id)
@@ -372,8 +391,132 @@ async def get_timeline(project_id: str):
     }
 
 
+# ─── Routes: Autonomous Loop ─────────────────────────────────────────
+
+@app.post("/projects/{project_id}/auto")
+async def auto_run(project_id: str):
+    """Kick off autonomous pipeline from current phase."""
+    p = await get_pool()
+    project = await p.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    phase = project["phase"]
+
+    if phase == "idea":
+        entries = await p.fetch(
+            "SELECT content FROM entries WHERE project_id = $1 AND phase = 'idea'", project_id
+        )
+        idea_text = "\n\n".join(e["content"] for e in entries)
+        if not idea_text:
+            raise HTTPException(400, "No idea entries found. Add an idea first.")
+
+        now = datetime.now(timezone.utc)
+        await p.execute(
+            "UPDATE projects SET phase = 'architecture', updated_at = $1 WHERE id = $2", now, project_id
+        )
+        asyncio.create_task(run_architecture(p, project_id, idea_text, notify))
+        return {"status": "started", "phase": "architecture", "message": "Architecture phase running..."}
+
+    elif phase == "architecture":
+        now = datetime.now(timezone.utc)
+        await p.execute(
+            "UPDATE projects SET phase = 'export', updated_at = $1 WHERE id = $2", now, project_id
+        )
+        asyncio.create_task(run_build(p, project_id, notify))
+        return {"status": "started", "phase": "build", "message": "Build phase running..."}
+
+    elif phase in ("review", "fix"):
+        return {"status": "error", "message": "Use /approve or /reject via Telegram for review phases"}
+
+    else:
+        return {"status": "error", "message": f"Cannot auto-run from phase: {phase}"}
+
+
+# ─── Routes: Telegram Webhook ───────────────────────────────────────
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Handle Telegram commands: /approve, /reject, /status"""
+    body = await request.json()
+    message = body.get("message", {})
+    text = message.get("text", "").strip()
+    chat_id = str(message.get("chat", {}).get("id", ""))
+
+    if chat_id != TELEGRAM_CHAT_ID:
+        return {"ok": True}
+
+    p = await get_pool()
+
+    if text.startswith("/approve "):
+        project_id = text.split(" ", 1)[1].strip()
+        project = await p.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+        if not project:
+            await notify(f"❌ Project `{project_id}` not found")
+            return {"ok": True}
+
+        phase = project["phase"]
+        if phase == "architecture":
+            await orch_add_entry(p, project_id, phase, "human", "APPROVED", "approval")
+            asyncio.create_task(run_build(p, project_id, notify))
+            await notify(f"👍 `{project_id}` approved. Build starting...")
+        elif phase in ("review", "fix"):
+            await orch_add_entry(p, project_id, phase, "human", "APPROVED FOR DEPLOY", "approval")
+            await orch_set_phase(p, project_id, "deploy")
+            await notify(f"🚀 `{project_id}` approved for deploy!")
+        else:
+            await notify(f"⚠️ `{project_id}` is in phase `{phase}` — nothing to approve right now")
+
+    elif text.startswith("/reject "):
+        project_id = text.split(" ", 1)[1].strip()
+        await notify(f"↩️ `{project_id}` — Send your feedback, then /retry {project_id}")
+
+    elif text.startswith("/retry "):
+        project_id = text.split(" ", 1)[1].strip()
+        project = await p.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+        if not project:
+            await notify(f"❌ Project `{project_id}` not found")
+            return {"ok": True}
+
+        phase = project["phase"]
+        if phase == "architecture":
+            entries = await p.fetch(
+                "SELECT content FROM entries WHERE project_id = $1 AND phase = 'idea'", project_id
+            )
+            idea_text = "\n\n".join(e["content"] for e in entries)
+            asyncio.create_task(run_architecture(p, project_id, idea_text, notify))
+            await notify(f"🔄 `{project_id}` — Re-running architecture...")
+        elif phase in ("build", "review", "fix"):
+            asyncio.create_task(run_build(p, project_id, notify))
+            await notify(f"🔄 `{project_id}` — Re-running build...")
+        else:
+            await notify(f"⚠️ `{project_id}` is in phase `{phase}` — nothing to retry")
+
+    elif text.startswith("/status"):
+        projects = await p.fetch("SELECT id, name, phase FROM projects ORDER BY updated_at DESC LIMIT 5")
+        if projects:
+            lines = [f"`{r['id']}` — {r['name']} [{r['phase']}]" for r in projects]
+            await notify("📊 *Active Projects*\n" + "\n".join(lines))
+        else:
+            await notify("📊 No projects yet")
+
+    return {"ok": True}
+
+
+# ─── Routes: Agent Logs ─────────────────────────────────────────────
+
+@app.get("/projects/{project_id}/logs")
+async def get_agent_logs(project_id: str):
+    """Get all agent API call logs for a project."""
+    p = await get_pool()
+    rows = await p.fetch(
+        "SELECT * FROM agent_logs WHERE project_id = $1 ORDER BY created_at DESC", project_id
+    )
+    return [dict(r) for r in rows]
+
+
 # ─── Health ───────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "alive", "service": "phantom-pipeline", "version": "1.0.0"}
+    return {"status": "alive", "service": "phantom-pipeline", "version": "2.0.0"}
