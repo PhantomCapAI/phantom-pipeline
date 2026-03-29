@@ -53,12 +53,18 @@ Rules:
 6. Use Python for backends, TypeScript/React for frontends unless spec says otherwise."""
 
 REVIEWER_SYSTEM = """You are the code reviewer for Phantom Capital.
-Given code output from the build agent, audit for:
-1. Correctness — does it match the spec?
-2. Security — SQL injection, auth bypass, exposed secrets, etc.
-3. Scalability — will it handle load? Connection pooling? Rate limiting?
-4. Error handling — does every failure path have proper handling?
-5. Missing pieces — anything the spec required that wasn't built?
+Given code output from the build agent, audit for CRITICAL issues ONLY:
+1. Correctness — does it match the spec? Are there missing files or broken logic?
+2. Security — ONLY flag actual vulnerabilities (SQL injection, auth bypass, exposed secrets). Do NOT flag theoretical hardening suggestions.
+3. Functionality — will the code actually run? Missing imports, syntax errors, broken references?
+4. Missing pieces — anything the spec REQUIRED that wasn't built?
+
+IMPORTANT RULES:
+- PASS the code if it is functional and matches the spec. Perfection is NOT required.
+- Do NOT flag style issues, best practices, or "nice to have" improvements.
+- Do NOT invent new issues that weren't in the original review. On fix cycles, ONLY check if the previously flagged issues were resolved.
+- If the code works and is safe, PASS it. Bias toward PASS.
+- A working MVP that matches the spec is a PASS.
 
 Output format:
 ## VERDICT: PASS or NEEDS_FIX
@@ -66,11 +72,10 @@ Output format:
 ## ISSUES (if any)
 For each issue:
 - File: [path]
-- Line/area: [where]
-- Problem: [what's wrong]
-- Fix: [exact code change needed]
+- Problem: [what's broken — must be a functional or security issue]
+- Fix: [exact change needed]
 
-If PASS, just say PASS with a brief summary of what was reviewed."""
+If PASS, say PASS with a one-line summary."""
 
 
 async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:

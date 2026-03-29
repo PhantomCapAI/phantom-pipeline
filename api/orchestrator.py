@@ -117,7 +117,7 @@ async def run_review(pool: asyncpg.Pool, project_id: str, code: str, spec: str, 
         await notify_fn(f"❌ `{project_id}` review failed: {str(e)[:200]}")
 
 
-async def run_fix(pool: asyncpg.Pool, project_id: str, original_code: str, review_result: str, spec: str, notify_fn, max_cycles: int = 3):
+async def run_fix(pool: asyncpg.Pool, project_id: str, original_code: str, review_result: str, spec: str, notify_fn, max_cycles: int = 5):
     """
     Fix cycle: send review issues back to build agent, re-review.
     Max 3 cycles to prevent infinite loops.
@@ -144,11 +144,11 @@ async def run_fix(pool: asyncpg.Pool, project_id: str, original_code: str, revie
                 f"Reply /approve {project_id} to ship it"
             )
         elif max_cycles > 1:
-            await notify_fn(f"🔄 `{project_id}` — Still has issues, running fix cycle {4 - max_cycles}/3...")
+            await notify_fn(f"🔄 `{project_id}` — Still has issues, running fix cycle {6 - max_cycles}/5...")
             await run_fix(pool, project_id, fixed_code, re_review, spec, notify_fn, max_cycles - 1)
         else:
             await notify_fn(
-                f"⚠️ `{project_id}` — Fix cycles exhausted (3/3). Manual intervention needed.\n"
+                f"⚠️ `{project_id}` — Fix cycles exhausted (5/5). Manual intervention needed.\n"
                 f"Check the timeline in the dashboard."
             )
 
