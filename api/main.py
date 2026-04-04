@@ -27,7 +27,7 @@ from orchestrator import (
 # ─── Config ───────────────────────────────────────────────────────────
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("OPS_TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1516882079")
 
 PHASES = ["idea", "architecture", "export", "build", "review", "fix", "deploy", "done"]
