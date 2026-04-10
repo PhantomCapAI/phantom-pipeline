@@ -688,10 +688,19 @@ async def _handle_content_callback(body: dict):
         draft_id = int(data.split("_")[-1])
         row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", draft_id)
         if row and row["status"] == "pending":
-            await p.execute(
-                "UPDATE content_reviews SET status = 'approved', updated_at = NOW() WHERE id = $1", draft_id
-            )
-            await notify(f"Content #{draft_id} approved and queued for posting.")
+            final_text = row["claude_final"] or row["gpt_draft"]
+            try:
+                results = post_thread(final_text)
+                tweet_ids = [r["tweet_id"] for r in results]
+                await p.execute(
+                    "UPDATE content_reviews SET status = 'posted', updated_at = NOW() WHERE id = $1", draft_id
+                )
+                await notify(f"Content #{draft_id} posted to @phantomcap_ai. Tweet IDs: {tweet_ids}")
+            except Exception as e:
+                await p.execute(
+                    "UPDATE content_reviews SET status = 'approved', updated_at = NOW() WHERE id = $1", draft_id
+                )
+                await notify(f"Content #{draft_id} approved but posting failed: {e}")
         else:
             await notify(f"Content #{draft_id} is no longer pending.")
 
