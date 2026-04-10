@@ -9,6 +9,7 @@ import os
 import uuid
 import json
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -22,6 +23,8 @@ from orchestrator import (
     run_architecture, run_build,
     add_entry as orch_add_entry, set_phase as orch_set_phase,
 )
+from bot_monitor import BOTS, query_bot_metrics, get_all_bot_metrics, check_targets
+from bot_iterator import generate_proposal, format_proposal_telegram
 
 
 # ─── Config ───────────────────────────────────────────────────────────
@@ -89,6 +92,16 @@ async def lifespan(app: FastAPI):
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """)
+    await p.execute("""
+        CREATE TABLE IF NOT EXISTS bot_iterations (
+            id TEXT PRIMARY KEY,
+            bot_name TEXT NOT NULL,
+            proposal JSONB NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    asyncio.create_task(bot_monitor_loop(p))
     yield
     if pool:
         await pool.close()
@@ -497,6 +510,47 @@ async def telegram_webhook(request: Request):
         else:
             await notify(f"⚠️ `{project_id}` is in phase `{phase}` — nothing to retry")
 
+    elif text.startswith("/bot_status"):
+        bp = await get_bot_pool()
+        if bp:
+            all_m = await get_all_bot_metrics(bp, 24)
+            lines = ["🤖 *Phantom Fleet (24h)*\n"]
+            for m in all_m:
+                issues = check_targets(m)
+                emoji = "✅" if not issues else "⚠️"
+                lines.append(f"{emoji} *{m.get('bot','?')}*")
+                for k, v in m.items():
+                    if k not in ('bot', 'period_hours', 'since', 'error'):
+                        lines.append(f"  {k}: `{v}`")
+                lines.append("")
+            await notify("\n".join(lines))
+        else:
+            await notify("❌ Bot DB not configured")
+
+    elif text.startswith("/bot_iterate"):
+        parts = text.split()
+        target = parts[1] if len(parts) > 1 else "all"
+        bp = await get_bot_pool()
+        if bp:
+            bots_to_check = [target] if target in BOTS else list(BOTS.keys())
+            count = 0
+            for bname in bots_to_check:
+                metrics = await query_bot_metrics(bp, bname, 24)
+                prop = generate_proposal(bname, metrics)
+                if prop:
+                    pid = uuid.uuid4().hex[:8]
+                    prop["project_id"] = pid
+                    await p.execute(
+                        "INSERT INTO bot_iterations (id, bot_name, proposal, status) VALUES ($1, $2, $3::jsonb, $4)",
+                        pid, bname, json.dumps(prop), "pending",
+                    )
+                    await notify(format_proposal_telegram(prop))
+                    count += 1
+            if count == 0:
+                await notify("✅ All bots meeting targets")
+        else:
+            await notify("❌ Bot DB not configured")
+
     elif text.startswith("/status"):
         projects = await p.fetch("SELECT id, name, phase FROM projects ORDER BY updated_at DESC LIMIT 5")
         if projects:
@@ -539,8 +593,79 @@ async def debug_agents():
         results["claude"] = {"status": "error", "error": str(e)}
     return results
 
+# ─── Bot Fleet Monitoring ─────────────────────────────────────────────
+
+BOT_DB_URL = os.getenv("BOT_DATABASE_URL", os.getenv("DATABASE_URL", ""))
+_bot_pool: Optional[asyncpg.Pool] = None
+
+
+async def get_bot_pool() -> Optional[asyncpg.Pool]:
+    """Lazy pool for the bot fleet's shared metrics database."""
+    global _bot_pool
+    if _bot_pool is None and BOT_DB_URL:
+        _bot_pool = await asyncpg.create_pool(BOT_DB_URL, min_size=1, max_size=3)
+    return _bot_pool
+
+
+async def bot_monitor_loop(pipeline_pool):
+    """Background task: every 6 hours, query each bot's metrics and propose
+    parameter adjustments for any bot below target. Proposals land in
+    bot_iterations and are pushed to Telegram for approval."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            bp = await get_bot_pool()
+            if not bp:
+                await asyncio.sleep(3600)
+                continue
+            for bot_name in BOTS:
+                metrics = await query_bot_metrics(bp, bot_name, hours=24)
+                proposal = generate_proposal(bot_name, metrics)
+                if proposal:
+                    pid = uuid.uuid4().hex[:8]
+                    proposal["project_id"] = pid
+                    await pipeline_pool.execute(
+                        "INSERT INTO bot_iterations (id, bot_name, proposal, status) VALUES ($1, $2, $3::jsonb, $4)",
+                        pid, bot_name, json.dumps(proposal), "pending",
+                    )
+                    await notify(format_proposal_telegram(proposal))
+        except Exception as e:
+            logging.getLogger("pipeline.bot_monitor").error(f"Monitor error: {e}")
+        await asyncio.sleep(6 * 3600)
+
+
+@app.get("/bots/status")
+async def bots_status(hours: int = Query(24)):
+    """All bot fleet metrics for the last N hours."""
+    bp = await get_bot_pool()
+    if not bp:
+        raise HTTPException(503, "Bot database not configured")
+    return await get_all_bot_metrics(bp, hours)
+
+
+@app.get("/bots/{bot_name}/metrics")
+async def bot_metrics(bot_name: str, hours: int = Query(24)):
+    """Single bot's metrics for the last N hours."""
+    if bot_name not in BOTS:
+        raise HTTPException(404, f"Unknown bot: {bot_name}")
+    bp = await get_bot_pool()
+    if not bp:
+        raise HTTPException(503, "Bot database not configured")
+    return await query_bot_metrics(bp, bot_name, hours)
+
+
+@app.get("/bots/iterations")
+async def list_iterations(status: str = Query("pending")):
+    """List bot tuning proposals filtered by status."""
+    p = await get_pool()
+    rows = await p.fetch(
+        "SELECT * FROM bot_iterations WHERE status = $1 ORDER BY created_at DESC LIMIT 20", status
+    )
+    return [dict(r) for r in rows]
+
+
 # ─── Health ───────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "alive", "service": "phantom-pipeline", "version": "3.0.0"}
+    return {"status": "alive", "service": "phantom-pipeline", "version": "3.1.0"}
