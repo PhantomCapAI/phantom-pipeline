@@ -7,9 +7,9 @@ import os
 import httpx
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api/v1")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 
 ARCHITECT_SYSTEM = """You are the product architect for Phantom Capital, an autonomous multi-agent AI business.
 Given an idea, produce a detailed system design spec including:
@@ -81,13 +81,14 @@ If PASS, say PASS with a one-line summary."""
 
 
 async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:
-    """Call OpenAI-compatible API (OpenRouter or direct) and return text response."""
+    """Call OpenAI-compatible API and return text response."""
+    is_openrouter = "openrouter" in OPENAI_BASE_URL
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             json={
-                "model": model if OPENAI_BASE_URL == "https://api.openai.com/v1" else f"openai/{model}",
+                "model": f"openai/{model}" if is_openrouter else model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_msg},
@@ -101,9 +102,9 @@ async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:
 
 
 async def call_claude(system: str, user_msg: str, model: str = "claude-sonnet-4-20250514") -> str:
-    """Call Claude via OpenRouter (chat completions format) or Anthropic API directly."""
-    if "openrouter" in ANTHROPIC_BASE_URL:
-        # OpenRouter uses OpenAI-compatible chat completions format
+    """Call Anthropic API directly, or via OpenRouter if configured."""
+    is_openrouter = "openrouter" in ANTHROPIC_BASE_URL
+    if is_openrouter:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{ANTHROPIC_BASE_URL}/chat/completions",
@@ -120,7 +121,6 @@ async def call_claude(system: str, user_msg: str, model: str = "claude-sonnet-4-
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
     else:
-        # Direct Anthropic API
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{ANTHROPIC_BASE_URL}/v1/messages",
