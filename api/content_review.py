@@ -6,7 +6,7 @@ RAW INPUT → GPT-4o draft → Claude editorial review → Telegram approval
 import os
 import httpx
 
-from agents import call_openai, call_claude
+from agents import call_claude
 
 TELEGRAM_BOT_TOKEN = os.getenv("OPS_TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1516882079")
@@ -54,7 +54,7 @@ Output ONLY the cleaned final draft. Preserve the EXACT formatting including all
 
 
 async def gpt_draft(raw_input: str, platform: str, tone: str, max_posts: int) -> str:
-    """Step 1: GPT-4o formats raw research into a draft."""
+    """Step 1: Claude drafts from raw research (was GPT-4o, switched to Anthropic direct)."""
     user_msg = f"""Platform: {platform}
 Tone: {tone}
 Max posts/sections: {max_posts}
@@ -62,7 +62,7 @@ Max posts/sections: {max_posts}
 Raw research:
 {raw_input}"""
 
-    return await call_openai(DRAFTER_SYSTEM, user_msg, model="gpt-4o")
+    return await call_claude(DRAFTER_SYSTEM, user_msg, model="claude-sonnet-4-20250514")
 
 
 async def claude_editorial(draft: str, platform: str, tone: str) -> str:
