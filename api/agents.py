@@ -83,7 +83,7 @@ If PASS, say PASS with a one-line summary."""
 async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:
     """Call OpenAI-compatible API and return text response."""
     is_openrouter = "openrouter" in OPENAI_BASE_URL
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
@@ -93,7 +93,7 @@ async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_msg},
                 ],
-                "max_tokens": 4096,
+                "max_tokens": 16384,
                 "temperature": 0.7,
             },
         )
@@ -110,7 +110,7 @@ async def call_claude(system: str, user_msg: str, model: str = "claude-sonnet-4-
     is_openrouter = "openrouter" in ANTHROPIC_BASE_URL
     if is_openrouter:
         model = OPENROUTER_MODEL_MAP.get(model, f"anthropic/{model}")
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
                 f"{ANTHROPIC_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {ANTHROPIC_API_KEY}"},
@@ -120,13 +120,13 @@ async def call_claude(system: str, user_msg: str, model: str = "claude-sonnet-4-
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_msg},
                     ],
-                    "max_tokens": 4096,
+                    "max_tokens": 16384,
                 },
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
     else:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
                 f"{ANTHROPIC_BASE_URL}/v1/messages",
                 headers={
@@ -136,7 +136,7 @@ async def call_claude(system: str, user_msg: str, model: str = "claude-sonnet-4-
                 },
                 json={
                     "model": model,
-                    "max_tokens": 4096,
+                    "max_tokens": 16384,
                     "system": system,
                     "messages": [{"role": "user", "content": user_msg}],
                 },
