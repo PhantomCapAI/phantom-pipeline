@@ -101,16 +101,21 @@ async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:
         return resp.json()["choices"][0]["message"]["content"]
 
 
+OPENROUTER_MODEL_MAP = {
+    "claude-sonnet-4-20250514": "anthropic/claude-sonnet-4-6",
+}
+
 async def call_claude(system: str, user_msg: str, model: str = "claude-sonnet-4-20250514") -> str:
     """Call Anthropic API directly, or via OpenRouter if configured."""
     is_openrouter = "openrouter" in ANTHROPIC_BASE_URL
     if is_openrouter:
+        model = OPENROUTER_MODEL_MAP.get(model, f"anthropic/{model}")
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{ANTHROPIC_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {ANTHROPIC_API_KEY}"},
                 json={
-                    "model": f"anthropic/{model}",
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_msg},
