@@ -18,10 +18,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import httpx
+
 from orchestrator import (
     run_architecture, run_build,
     add_entry as orch_add_entry, set_phase as orch_set_phase,
 )
+from content_review import gpt_draft, claude_editorial, send_telegram_draft
 
 
 # ─── Config ───────────────────────────────────────────────────────────
@@ -87,6 +90,19 @@ async def lifespan(app: FastAPI):
             cost_estimate NUMERIC(10, 6),
             latency_ms INTEGER,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    await p.execute("""
+        CREATE TABLE IF NOT EXISTS content_reviews (
+            id SERIAL PRIMARY KEY,
+            raw_input TEXT NOT NULL,
+            gpt_draft TEXT,
+            claude_final TEXT,
+            platform VARCHAR(20) NOT NULL,
+            tone VARCHAR(20) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """)
     yield
@@ -437,8 +453,13 @@ async def auto_run(project_id: str):
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    """Handle Telegram commands: /approve, /reject, /status"""
+    """Handle Telegram commands and inline button callbacks."""
     body = await request.json()
+
+    # Route inline button callbacks (content review approve/reject/edit)
+    if "callback_query" in body:
+        return await _handle_content_callback(body)
+
     message = body.get("message", {})
     text = message.get("text", "").strip()
     chat_id = str(message.get("chat", {}).get("id", ""))
@@ -535,8 +556,161 @@ async def debug_agents():
     return results
 
 
+# ─── Routes: Content Review Pipeline ────────────────────────────────
+
+class ContentReviewRequest(BaseModel):
+    raw_input: str
+    platform: str = Field(..., pattern="^(x_thread|blog|telegram)$")
+    tone: str = Field("rough", pattern="^(rough|professional|degen)$")
+    max_posts: int = Field(5, ge=1, le=20)
+
+
+@app.post("/content/review")
+async def content_review(body: ContentReviewRequest):
+    """RAW INPUT -> GPT-4o draft -> Claude editorial -> Telegram approval."""
+    p = await get_pool()
+
+    row = await p.fetchrow(
+        "INSERT INTO content_reviews (raw_input, platform, tone) VALUES ($1, $2, $3) RETURNING id",
+        body.raw_input, body.platform, body.tone,
+    )
+    draft_id = row["id"]
+
+    # Step 1: GPT-4o drafts
+    gpt_result = await gpt_draft(body.raw_input, body.platform, body.tone, body.max_posts)
+    await p.execute(
+        "UPDATE content_reviews SET gpt_draft = $1, updated_at = NOW() WHERE id = $2",
+        gpt_result, draft_id,
+    )
+
+    # Step 2: Claude editorial review
+    claude_result = await claude_editorial(gpt_result, body.platform, body.tone)
+    await p.execute(
+        "UPDATE content_reviews SET claude_final = $1, updated_at = NOW() WHERE id = $2",
+        claude_result, draft_id,
+    )
+
+    # Step 3: Send to Telegram for approval
+    await send_telegram_draft(draft_id, claude_result, body.platform)
+
+    return {
+        "id": draft_id,
+        "status": "pending",
+        "platform": body.platform,
+        "gpt_draft": gpt_result,
+        "claude_final": claude_result,
+        "message": "Draft sent to Telegram for approval",
+    }
+
+
+@app.get("/content/queue")
+async def content_queue():
+    """Return all pending content drafts."""
+    p = await get_pool()
+    rows = await p.fetch(
+        "SELECT id, platform, tone, status, claude_final, created_at FROM content_reviews WHERE status = 'pending' ORDER BY created_at DESC"
+    )
+    return [dict(r) for r in rows]
+
+
+@app.post("/content/{draft_id}/approve")
+async def content_approve(draft_id: int):
+    """Approve a content draft — queued for posting."""
+    p = await get_pool()
+    row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", draft_id)
+    if not row:
+        raise HTTPException(404, "Draft not found")
+    if row["status"] != "pending":
+        raise HTTPException(400, f"Draft is already {row['status']}")
+    await p.execute(
+        "UPDATE content_reviews SET status = 'approved', updated_at = NOW() WHERE id = $1", draft_id
+    )
+    await notify(f"Content #{draft_id} approved and queued for posting.")
+    return {"id": draft_id, "status": "approved"}
+
+
+@app.post("/content/{draft_id}/reject")
+async def content_reject(draft_id: int):
+    """Reject a content draft — discarded."""
+    p = await get_pool()
+    row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", draft_id)
+    if not row:
+        raise HTTPException(404, "Draft not found")
+    if row["status"] != "pending":
+        raise HTTPException(400, f"Draft is already {row['status']}")
+    await p.execute(
+        "UPDATE content_reviews SET status = 'rejected', updated_at = NOW() WHERE id = $1", draft_id
+    )
+    await notify(f"Content #{draft_id} rejected and discarded.")
+    return {"id": draft_id, "status": "rejected"}
+
+
+# ─── Telegram Callback Handler (inline buttons) ────────────────────
+
+async def _handle_content_callback(body: dict):
+    """Handle inline keyboard button presses for content review."""
+    callback = body.get("callback_query", {})
+    data = callback.get("data", "")
+    callback_id = callback.get("id", "")
+    chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+
+    if chat_id != TELEGRAM_CHAT_ID:
+        return {"ok": True}
+
+    # Answer the callback to remove loading spinner
+    if TELEGRAM_BOT_TOKEN and callback_id:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                    json={"callback_query_id": callback_id},
+                )
+        except Exception:
+            pass
+
+    p = await get_pool()
+
+    if data.startswith("cr_approve_"):
+        draft_id = int(data.split("_")[-1])
+        row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", draft_id)
+        if row and row["status"] == "pending":
+            await p.execute(
+                "UPDATE content_reviews SET status = 'approved', updated_at = NOW() WHERE id = $1", draft_id
+            )
+            await notify(f"Content #{draft_id} approved and queued for posting.")
+        else:
+            await notify(f"Content #{draft_id} is no longer pending.")
+
+    elif data.startswith("cr_reject_"):
+        draft_id = int(data.split("_")[-1])
+        row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", draft_id)
+        if row and row["status"] == "pending":
+            await p.execute(
+                "UPDATE content_reviews SET status = 'rejected', updated_at = NOW() WHERE id = $1", draft_id
+            )
+            await notify(f"Content #{draft_id} rejected and discarded.")
+        else:
+            await notify(f"Content #{draft_id} is no longer pending.")
+
+    elif data.startswith("cr_edit_"):
+        draft_id = int(data.split("_")[-1])
+        row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", draft_id)
+        if row and row["status"] == "pending" and row["gpt_draft"]:
+            # Re-run Claude editorial on the GPT draft
+            claude_result = await claude_editorial(row["gpt_draft"], row["platform"], row["tone"])
+            await p.execute(
+                "UPDATE content_reviews SET claude_final = $1, updated_at = NOW() WHERE id = $2",
+                claude_result, draft_id,
+            )
+            await send_telegram_draft(draft_id, claude_result, row["platform"])
+        else:
+            await notify(f"Content #{draft_id} is no longer pending.")
+
+    return {"ok": True}
+
+
 # ─── Health ───────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "alive", "service": "phantom-pipeline", "version": "2.0.0"}
+    return {"status": "alive", "service": "phantom-pipeline", "version": "2.1.0"}
