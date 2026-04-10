@@ -22,6 +22,8 @@ from orchestrator import (
     run_architecture, run_build,
     add_entry as orch_add_entry, set_phase as orch_set_phase,
 )
+from agents import call_openai, call_claude
+import html as html_mod
 
 
 # ─── Config ───────────────────────────────────────────────────────────
@@ -31,6 +33,20 @@ TELEGRAM_BOT_TOKEN = os.getenv("OPS_TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1516882079")
 
 PHASES = ["idea", "architecture", "export", "build", "review", "fix", "deploy", "done"]
+
+CONTENT_WRITER_SYSTEM = (
+    "You are a crypto-native content writer for Phantom Capital (@phantomcap_ai). "
+    "Format raw research into a platform-ready thread. "
+    "Tone: rough, opinionated, specific. No AI slop. No filler. No generic takes."
+)
+
+CONTENT_EDITOR_SYSTEM = (
+    "You are the editorial filter for Phantom Capital. Review this draft thread. "
+    "Check for: financial advice language (change 'you should buy' to 'we are watching'), "
+    "excessive handle tagging (max 1 mention per handle per thread), "
+    "exact wallet-traceable dollar amounts (round all values), AI slop phrases, legal risk. "
+    "Return the cleaned final version ready to post."
+)
 
 
 # ─── DB Pool ──────────────────────────────────────────────────────────
@@ -89,6 +105,19 @@ async def lifespan(app: FastAPI):
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """)
+    await p.execute("""
+        CREATE TABLE IF NOT EXISTS content_reviews (
+            id SERIAL PRIMARY KEY,
+            raw_input TEXT,
+            gpt_draft TEXT,
+            claude_final TEXT,
+            platform VARCHAR(20),
+            tone VARCHAR(20),
+            status VARCHAR(20) DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
     yield
     if pool:
         await pool.close()
@@ -123,6 +152,12 @@ class AdvancePhase(BaseModel):
 class GenerateExport(BaseModel):
     include_code_samples: bool = True
 
+class ContentReviewInput(BaseModel):
+    raw_input: str
+    platform: str = Field("x_thread", description="x_thread | blog | telegram")
+    tone: str = Field("rough", description="rough | professional | degen")
+    max_posts: int = Field(5, description="Maximum number of posts in thread")
+
 
 # ─── Telegram notify ─────────────────────────────────────────────────
 
@@ -140,6 +175,146 @@ async def notify(msg: str):
             )
     except Exception:
         pass
+
+
+async def notify_with_keyboard(msg: str, buttons: list):
+    """Send Telegram message with inline keyboard buttons."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": msg,
+                    "parse_mode": "HTML",
+                    "reply_markup": {"inline_keyboard": buttons},
+                },
+                timeout=10,
+            )
+    except Exception:
+        pass
+
+
+async def answer_callback(callback_query_id: str, text: str = ""):
+    """Answer a Telegram callback query to dismiss the loading spinner."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                json={"callback_query_id": callback_query_id, "text": text},
+                timeout=5,
+            )
+    except Exception:
+        pass
+
+
+# ─── Content Review Pipeline ────────────────────────────────────────
+
+async def run_content_review(review_id: int, raw_input: str, platform: str, tone: str, max_posts: int):
+    """Pipeline: OpenAI draft → Claude editorial → Telegram approval."""
+    p = await get_pool()
+    try:
+        # Step 1: OpenAI formats raw input into draft
+        tone_desc = {
+            "rough": "rough, opinionated, specific",
+            "professional": "professional, measured, authoritative",
+            "degen": "full degen, CT native, memes welcome",
+        }.get(tone, "rough, opinionated, specific")
+
+        platform_desc = {
+            "x_thread": f"an X/Twitter thread (max {max_posts} numbered tweets, each under 280 chars)",
+            "blog": "a blog post",
+            "telegram": "a Telegram post",
+        }.get(platform, f"an X/Twitter thread (max {max_posts} posts)")
+
+        user_prompt = (
+            f"Format this raw research into {platform_desc}.\n"
+            f"Tone: {tone_desc}.\n\n"
+            f"RAW RESEARCH:\n{raw_input}"
+        )
+        gpt_draft = await call_openai(CONTENT_WRITER_SYSTEM, user_prompt)
+
+        await p.execute(
+            "UPDATE content_reviews SET gpt_draft = $1, updated_at = NOW() WHERE id = $2",
+            gpt_draft, review_id,
+        )
+
+        # Step 2: Claude editorial review
+        claude_final = await call_claude(
+            CONTENT_EDITOR_SYSTEM,
+            f"Review and clean this draft:\n\n{gpt_draft}",
+        )
+
+        await p.execute(
+            "UPDATE content_reviews SET claude_final = $1, updated_at = NOW() WHERE id = $2",
+            claude_final, review_id,
+        )
+
+        # Step 3: Send to Telegram with inline keyboard
+        safe_content = html_mod.escape(claude_final)
+        if len(safe_content) > 3500:
+            safe_content = safe_content[:3500] + "\n\n[truncated]"
+
+        tg_msg = (
+            f"<b>📝 Content Review #{review_id}</b>\n\n"
+            f"{safe_content}\n\n"
+            f"<i>Platform: {platform} | Tone: {tone}</i>"
+        )
+        buttons = [[
+            {"text": "✅ Approve", "callback_data": f"cr_approve_{review_id}"},
+            {"text": "❌ Reject", "callback_data": f"cr_reject_{review_id}"},
+            {"text": "✏️ Edit", "callback_data": f"cr_edit_{review_id}"},
+        ]]
+        await notify_with_keyboard(tg_msg, buttons)
+
+    except Exception as e:
+        await p.execute(
+            "UPDATE content_reviews SET status = 'error', updated_at = NOW() WHERE id = $1",
+            review_id,
+        )
+        await notify(f"❌ Content review #{review_id} failed: {str(e)[:200]}")
+
+
+async def _rerun_editorial(review_id: int, gpt_draft: str, feedback: str, platform: str, tone: str):
+    """Re-run Claude editorial review with user feedback."""
+    p = await get_pool()
+    try:
+        claude_final = await call_claude(
+            CONTENT_EDITOR_SYSTEM,
+            f"Review and clean this draft. Apply this feedback from the editor:\n\n"
+            f"FEEDBACK: {feedback}\n\n"
+            f"DRAFT:\n{gpt_draft}",
+        )
+
+        await p.execute(
+            "UPDATE content_reviews SET claude_final = $1, updated_at = NOW() WHERE id = $2",
+            claude_final, review_id,
+        )
+
+        safe_content = html_mod.escape(claude_final)
+        if len(safe_content) > 3500:
+            safe_content = safe_content[:3500] + "\n\n[truncated]"
+
+        tg_msg = (
+            f"<b>📝 Content Review #{review_id} (revised)</b>\n\n"
+            f"{safe_content}\n\n"
+            f"<i>Platform: {platform} | Tone: {tone}</i>"
+        )
+        buttons = [[
+            {"text": "✅ Approve", "callback_data": f"cr_approve_{review_id}"},
+            {"text": "❌ Reject", "callback_data": f"cr_reject_{review_id}"},
+            {"text": "✏️ Edit", "callback_data": f"cr_edit_{review_id}"},
+        ]]
+        await notify_with_keyboard(tg_msg, buttons)
+
+    except Exception as e:
+        await notify(f"❌ Editorial re-review #{review_id} failed: {str(e)[:200]}")
 
 
 # ─── Routes: Projects ────────────────────────────────────────────────
@@ -433,12 +608,116 @@ async def auto_run(project_id: str):
         return {"status": "error", "message": f"Cannot auto-run from phase: {phase}"}
 
 
+# ─── Routes: Content Review ─────────────────────────────────────────
+
+@app.post("/content/review")
+async def content_review(body: ContentReviewInput):
+    """Submit raw research for the content review pipeline."""
+    p = await get_pool()
+    row = await p.fetchrow(
+        "INSERT INTO content_reviews (raw_input, platform, tone) VALUES ($1, $2, $3) RETURNING id",
+        body.raw_input, body.platform, body.tone,
+    )
+    review_id = row["id"]
+    asyncio.create_task(
+        run_content_review(review_id, body.raw_input, body.platform, body.tone, body.max_posts)
+    )
+    return {"id": review_id, "status": "processing", "message": "Content review pipeline started"}
+
+
+@app.get("/content/queue")
+async def content_queue():
+    """Return all pending content review drafts."""
+    p = await get_pool()
+    rows = await p.fetch(
+        "SELECT * FROM content_reviews WHERE status = 'pending' ORDER BY created_at DESC"
+    )
+    return [dict(r) for r in rows]
+
+
+@app.post("/content/{review_id}/approve")
+async def content_approve(review_id: int):
+    """Approve a content review draft."""
+    p = await get_pool()
+    row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", review_id)
+    if not row:
+        raise HTTPException(404, "Content review not found")
+    await p.execute(
+        "UPDATE content_reviews SET status = 'approved', updated_at = NOW() WHERE id = $1",
+        review_id,
+    )
+    await notify(f"✅ Content #{review_id} approved — queued for posting via Claire X API")
+    return {"id": review_id, "status": "approved"}
+
+
+@app.post("/content/{review_id}/reject")
+async def content_reject(review_id: int):
+    """Reject a content review draft."""
+    p = await get_pool()
+    row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", review_id)
+    if not row:
+        raise HTTPException(404, "Content review not found")
+    await p.execute(
+        "UPDATE content_reviews SET status = 'rejected', updated_at = NOW() WHERE id = $1",
+        review_id,
+    )
+    await notify(f"🗑️ Content #{review_id} rejected and logged")
+    return {"id": review_id, "status": "rejected"}
+
+
 # ─── Routes: Telegram Webhook ───────────────────────────────────────
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    """Handle Telegram commands: /approve, /reject, /status"""
+    """Handle Telegram commands, content review callbacks, and /edit."""
     body = await request.json()
+
+    # ── Handle inline keyboard callback queries (content review buttons) ──
+    callback = body.get("callback_query")
+    if callback:
+        cb_id = callback["id"]
+        cb_data = callback.get("data", "")
+        cb_chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+
+        if cb_chat_id != TELEGRAM_CHAT_ID:
+            return {"ok": True}
+
+        p = await get_pool()
+
+        if cb_data.startswith("cr_approve_"):
+            review_id = int(cb_data.split("_", 2)[2])
+            row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", review_id)
+            if row:
+                await p.execute(
+                    "UPDATE content_reviews SET status = 'approved', updated_at = NOW() WHERE id = $1",
+                    review_id,
+                )
+                await answer_callback(cb_id, "Approved!")
+                await notify(f"✅ Content #{review_id} approved — queued for posting via Claire X API")
+            else:
+                await answer_callback(cb_id, "Not found")
+
+        elif cb_data.startswith("cr_reject_"):
+            review_id = int(cb_data.split("_", 2)[2])
+            row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", review_id)
+            if row:
+                await p.execute(
+                    "UPDATE content_reviews SET status = 'rejected', updated_at = NOW() WHERE id = $1",
+                    review_id,
+                )
+                await answer_callback(cb_id, "Rejected")
+                await notify(f"🗑️ Content #{review_id} rejected and logged")
+            else:
+                await answer_callback(cb_id, "Not found")
+
+        elif cb_data.startswith("cr_edit_"):
+            review_id = int(cb_data.split("_", 2)[2])
+            await answer_callback(cb_id, "Send your edits")
+            await notify(f"✏️ Reply with: `/edit {review_id} <your feedback>`")
+
+        return {"ok": True}
+
+    # ── Handle regular messages ──
     message = body.get("message", {})
     text = message.get("text", "").strip()
     chat_id = str(message.get("chat", {}).get("id", ""))
@@ -448,7 +727,31 @@ async def telegram_webhook(request: Request):
 
     p = await get_pool()
 
-    if text.startswith("/approve "):
+    if text.startswith("/edit "):
+        # Content review edit: /edit {id} {feedback}
+        parts = text.split(" ", 2)
+        if len(parts) >= 3:
+            try:
+                review_id = int(parts[1])
+                feedback = parts[2]
+                row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", review_id)
+                if row and row["gpt_draft"]:
+                    await p.execute(
+                        "UPDATE content_reviews SET status = 'pending', updated_at = NOW() WHERE id = $1",
+                        review_id,
+                    )
+                    await notify(f"🔄 Re-running editorial review for content #{review_id}...")
+                    asyncio.create_task(
+                        _rerun_editorial(review_id, row["gpt_draft"], feedback, row["platform"], row["tone"])
+                    )
+                else:
+                    await notify(f"❌ Content #{review_id} not found or no draft available")
+            except ValueError:
+                await notify("❌ Usage: `/edit <id> <your feedback>`")
+        else:
+            await notify("❌ Usage: `/edit <id> <your feedback>`")
+
+    elif text.startswith("/approve "):
         project_id = text.split(" ", 1)[1].strip()
         project = await p.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
         if not project:
