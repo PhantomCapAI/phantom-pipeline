@@ -7,7 +7,9 @@ import os
 import httpx
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api/v1")
 
 ARCHITECT_SYSTEM = """You are the product architect for Phantom Capital, an autonomous multi-agent AI business.
 Given an idea, produce a detailed system design spec including:
@@ -79,13 +81,13 @@ If PASS, say PASS with a one-line summary."""
 
 
 async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:
-    """Call OpenAI API and return text response."""
+    """Call OpenAI-compatible API (OpenRouter or direct) and return text response."""
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
+            f"{OPENAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             json={
-                "model": model,
+                "model": model if OPENAI_BASE_URL == "https://api.openai.com/v1" else f"openai/{model}",
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_msg},
@@ -99,25 +101,44 @@ async def call_openai(system: str, user_msg: str, model: str = "gpt-4o") -> str:
 
 
 async def call_claude(system: str, user_msg: str, model: str = "claude-sonnet-4-20250514") -> str:
-    """Call Anthropic API and return text response."""
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model,
-                "max_tokens": 4096,
-                "system": system,
-                "messages": [{"role": "user", "content": user_msg}],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return "".join(block["text"] for block in data["content"] if block["type"] == "text")
+    """Call Claude via OpenRouter (chat completions format) or Anthropic API directly."""
+    if "openrouter" in ANTHROPIC_BASE_URL:
+        # OpenRouter uses OpenAI-compatible chat completions format
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{ANTHROPIC_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {ANTHROPIC_API_KEY}"},
+                json={
+                    "model": f"anthropic/{model}",
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "max_tokens": 4096,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+    else:
+        # Direct Anthropic API
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{ANTHROPIC_BASE_URL}/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 4096,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user_msg}],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return "".join(block["text"] for block in data["content"] if block["type"] == "text")
 
 
 async def architect(idea: str) -> str:
