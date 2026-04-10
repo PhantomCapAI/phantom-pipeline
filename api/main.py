@@ -25,6 +25,7 @@ from orchestrator import (
     add_entry as orch_add_entry, set_phase as orch_set_phase,
 )
 from content_review import gpt_draft, claude_editorial, send_telegram_draft
+from twitter_poster import post_thread
 
 
 # ─── Config ───────────────────────────────────────────────────────────
@@ -615,18 +616,31 @@ async def content_queue():
 
 @app.post("/content/{draft_id}/approve")
 async def content_approve(draft_id: int):
-    """Approve a content draft — queued for posting."""
+    """Approve a content draft and post to X."""
     p = await get_pool()
     row = await p.fetchrow("SELECT * FROM content_reviews WHERE id = $1", draft_id)
     if not row:
         raise HTTPException(404, "Draft not found")
     if row["status"] != "pending":
         raise HTTPException(400, f"Draft is already {row['status']}")
+
+    final_text = row["claude_final"] or row["gpt_draft"]
+    tweet_ids = []
+
+    try:
+        results = post_thread(final_text)
+        tweet_ids = [r["tweet_id"] for r in results]
+        status = "posted"
+        await notify(f"Content #{draft_id} posted to @phantomcap_ai. Tweet IDs: {tweet_ids}")
+    except Exception as e:
+        status = "approved"
+        await notify(f"Content #{draft_id} approved but posting failed: {e}")
+
     await p.execute(
-        "UPDATE content_reviews SET status = 'approved', updated_at = NOW() WHERE id = $1", draft_id
+        "UPDATE content_reviews SET status = $1, updated_at = NOW() WHERE id = $2",
+        status, draft_id,
     )
-    await notify(f"Content #{draft_id} approved and queued for posting.")
-    return {"id": draft_id, "status": "approved"}
+    return {"id": draft_id, "status": status, "tweet_ids": tweet_ids}
 
 
 @app.post("/content/{draft_id}/reject")
