@@ -1,0 +1,16 @@
+{
+  "name": "Phantom Pipeline Test Project",
+  "description": "Sample test project to verify the orchestrator works end-to-end. Demonstrates ops-check integration.",
+  "initial_idea": "Create a simple echo agent that responds to test commands, runs phantom-ops-check, and logs success.",
+  "phases": [
+    {
+      "phase": "IDEA",
+      "content": "Build a minimal test agent for demonstrating phantom-pipeline functionality. It should:
+1. Trigger phantom-ops-check pre-flight.
+2. Log a test message.
+3. Complete the full workflow successfully.",
+      "author": "Human",
+      "timestamp": "2026-05-17T16:00:00Z"
+    }
+  ]
+}
